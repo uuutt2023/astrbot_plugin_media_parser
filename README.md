@@ -9,7 +9,7 @@ _✨ 自动解析流媒体平台链接，转换为媒体直链发送 ✨_
 [![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0.html)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
-[![Version](https://img.shields.io/badge/Version-v6.5.0-green.svg)](https://github.com/drdon1234/astrbot_plugin_media_parser)
+[![Version](https://img.shields.io/badge/Version-v6.5.1-green.svg)](https://github.com/drdon1234/astrbot_plugin_media_parser)
 [![GitHub](https://img.shields.io/badge/作者-drdon1234-blue)](https://github.com/drdon1234)
 
 </div>
@@ -104,6 +104,7 @@ _✨ 自动解析流媒体平台链接，转换为媒体直链发送 ✨_
 - ✅ 可将引用链接的解析文本和已下载媒体打包为 ZIP 文件发送
 - ✅ 可选 B站 Cookie 解锁高画质 + 管理员协助自动续期
 - ✅ 媒体中转模式，跨服务器部署无需共享目录
+- ✅ 自动补全 B站 buvid 设备指纹，规避 412 风控，**无需任何配置**
 
 ---
 
@@ -189,6 +190,47 @@ QQ 普通文本消息没有可移植的“超链接文本”协议，因此插�
 - **Twitter/X**：支持 Range 请求，配置缓存目录后可并发下载提升速度
 
 > 💡 Range 下载仅为性能优化，未配置缓存目录时普通视频会尽量退化为直链发送；必须缓存的媒体会被跳过并在文本中说明原因
+
+---
+
+## 🛡️ B站风控绕过（buvid 自动补全）
+
+B 站部分接口（`x/web-interface/view`、`x/web-interface/wbi/view` 等）在请求
+**缺少 `buvid3` / `buvid4` Cookie** 时，返回的不是 JSON 错误码，而是
+**412 Precondition Failed + 一坨风控 HTML**，表现为：
+
+```
+API返回非JSON响应 (状态码: 412, Content-Type: text/html): <!DOCTYPE html>...
+```
+
+**WBI 签名绕不过这个校验** —— 带签名但无 buvid 依旧是 412。
+
+### 插件的处理
+
+从 v6.5.1 起，插件会自动通过
+`https://api.bilibili.com/x/frontend/finger/spi` 匿名获取一组
+`buvid3` / `buvid4`（**不需要登录、不需要配置**），并合并进 B 站 API 的
+请求 Cookie：
+
+- 用户没配 Cookie → 只用自动获取的 buvid，**照常解析**
+- 用户配了 Cookie 但没有 buvid → 保留用户 Cookie，补上 buvid
+- 用户配的 Cookie 里已有 buvid → **以用户的为准**，绝不覆盖
+
+buvid 带 TTL 缓存（默认 1 小时），获取失败只是 warning，不会中断解析流程。
+
+### 短链展开也一并修了
+
+`b23.tv` 短链以前用 `allow_redirects=True` 展开，会顺着 302 真的去请求
+`www.bilibili.com/video/...` 这个 **HTML 页面** —— 而 B 站的 web 风控对
+它直接返回 412，等于白跑一趟还必然失败。
+
+现在改为**不跟随重定向、只读 302 的 `Location` 头**（与
+[astrbot_plugin_denia_share](https://github.com/xiaoxi2760/astrbot_plugin_denia_share)
+的 `get_redirect_url` 思路一致），既绕开风控又更快。同时支持
+`bili2233.cn` 备用短链域名。
+
+> **提示**：如果你之前遇到过「B站链接解析失败 + 412」，升级到 v6.5.1 即可，
+> 无需任何配置改动。
 
 ---
 

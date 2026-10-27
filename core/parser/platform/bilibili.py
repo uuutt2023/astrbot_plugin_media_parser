@@ -7,13 +7,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, urlencode, urljoin
 
 import aiohttp
 
 from ...logger import logger
 
 from .base import BaseVideoParser
+from .bilibili_buvid import BuvidProvider
 from ..runtime_manager.bilibili.auth import BilibiliAuthRuntime
 from ..utils import build_request_headers, is_live_url, SkipParse, format_duration_ms
 from ...constants import Config
@@ -22,7 +23,12 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-B23_HOST = "b23.tv"
+#: B 站短链域名（b23.tv 为主，bili2233.cn 为备用）
+SHORT_LINK_HOSTS = ("b23.tv", "bili2233.cn")
+#: 短链最多跟随的重定向跳数
+SHORT_LINK_MAX_HOPS = 3
+#: 视为重定向的 HTTP 状态码
+REDIRECT_STATUS_CODES = (301, 302, 303, 307, 308)
 BV_RE = re.compile(r"[Bb][Vv][0-9A-Za-z]{10,}")
 AV_RE = re.compile(r"[Aa][Vv](\d+)")
 EP_PATH_RE = re.compile(r"/bangumi/play/ep(\d+)", re.IGNORECASE)
@@ -104,6 +110,7 @@ class BilibiliParser(BaseVideoParser):
         )
         self._assist_request_reason: Optional[str] = None
         self._assist_request_pending = False
+        self._buvid_provider = BuvidProvider()
         self._default_headers = {
             "User-Agent": UA,
             "Referer": "https://www.bilibili.com",
@@ -133,20 +140,35 @@ class BilibiliParser(BaseVideoParser):
         self,
         session: aiohttp.ClientSession
     ) -> str:
-        """异步获取当前请求可用的 Cookie 请求头。"""
-        if not self.cookie_runtime_enabled:
-            return ""
+        """异步获取当前请求可用的 Cookie 请求头。
 
-        cookie_header = await self.auth_runtime.get_cookie_header_for_request(
-            session
-        )
-        if cookie_header:
-            return cookie_header
+        这里返回的 Cookie **必定带得上 buvid3/buvid4**：
+        B 站的 ``x/web-interface/view`` 等接口在缺少 buvid 时会返回
+        **412 + 风控 HTML**（而不是 JSON 错误码），WBI 签名也绕不过去。
+        buvid 通过 ``finger/spi`` 匿名获取，**不需要登录**。
 
-        self._mark_assist_request(
-            self.auth_runtime.cookie_unavailable_reason or "cookie_unavailable"
-        )
-        return ""
+        - 启用了 Cookie 功能：用户 Cookie 为底，缺 buvid 就补
+        - 未启用 Cookie 功能：只用自动获取的 buvid
+        - 用户 Cookie 里已有 buvid：以用户的为准，不覆盖
+        """
+        user_cookie = ""
+        if self.cookie_runtime_enabled:
+            user_cookie = await self.auth_runtime.get_cookie_header_for_request(
+                session
+            )
+            if not user_cookie:
+                self._mark_assist_request(
+                    self.auth_runtime.cookie_unavailable_reason
+                    or "cookie_unavailable"
+                )
+
+        try:
+            return await self._buvid_provider.ensure_buvid(session, user_cookie)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[{self.name}] 补充buvid失败: {e}")
+            return user_cookie
 
     def _build_api_headers(
         self,
@@ -508,7 +530,7 @@ class BilibiliParser(BaseVideoParser):
             logger.debug(f"[{self.name}] can_parse: 匹配动态链接 {url}")
             return True
 
-        if B23_HOST in urlparse(url).netloc.lower():
+        if self._is_short_link_host(urlparse(url).netloc):
             logger.debug(f"[{self.name}] can_parse: 匹配b23短链 {url}")
             return True
 
@@ -676,12 +698,36 @@ class BilibiliParser(BaseVideoParser):
             logger.debug(f"[{self.name}] extract_links: 未提取到链接")
         return result
 
+    @staticmethod
+    def _is_short_link_host(netloc: str) -> bool:
+        """判断主机名是否属于 B 站短链域名。
+
+        用「完全相等或子域」判定，避免 ``fake-b23.tv`` 这类蹭域名的地址被误判。
+        """
+        host = (netloc or "").lower().split(":")[0]
+        if not host:
+            return False
+        return any(
+            host == domain or host.endswith(f".{domain}")
+            for domain in SHORT_LINK_HOSTS
+        )
+
     async def expand_b23(
         self,
         url: str,
         session: aiohttp.ClientSession
     ) -> str:
-        """展开b23短链
+        """展开 B 站短链（b23.tv / bili2233.cn）。
+
+        **不跟随重定向**，只读 302 的 ``Location`` 头。
+
+        为什么不能像以前那样 ``allow_redirects=True``：短链跳到的
+        ``www.bilibili.com/video/...`` 是个 **HTML 页面**，B 站的风控会对它
+        返回 **412 + 风控 HTML**。跟着跳就会额外拉一个必然失败的页面，
+        慢且毫无意义 —— 我们要的只是 Location 里那个 BV 号。
+
+        参考实现：https://github.com/xiaoxi2760/astrbot_plugin_denia_share
+        （其 ``get_redirect_url`` 同样是 ``follow_redirects=False`` + 读 Location）
 
         Args:
             url: 原始URL
@@ -690,24 +736,47 @@ class BilibiliParser(BaseVideoParser):
         Returns:
             展开后的URL，如果展开失败返回原URL
         """
-        if urlparse(url).netloc.lower() == B23_HOST:
-            headers = {
-                "User-Agent": UA,
-                "Referer": "https://www.bilibili.com",
-                "Accept-Encoding": "gzip, deflate",
-            }
+        try:
+            netloc = urlparse(url).netloc
+        except Exception:
+            return url
+        if not self._is_short_link_host(netloc):
+            return url
+
+        headers = {
+            "User-Agent": UA,
+            "Referer": "https://www.bilibili.com",
+            "Accept-Encoding": "gzip, deflate",
+        }
+
+        current = url
+        for _ in range(SHORT_LINK_MAX_HOPS):
             try:
                 async with session.get(
-                    url,
+                    current,
                     headers=headers,
-                    allow_redirects=True,
+                    allow_redirects=False,
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as r:
-                    expanded_url = str(r.url)
-                    return expanded_url
-            except Exception:
+                    if r.status in REDIRECT_STATUS_CODES:
+                        location = r.headers.get("Location") or ""
+                        if not location:
+                            return current
+                        current = urljoin(current, location)
+                        # 落点已经不是短链域名，说明展开完成
+                        if not self._is_short_link_host(urlparse(current).netloc):
+                            return current
+                        continue
+                    # 没有重定向：短链直接返回内容，取当前地址即可
+                    return current
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(
+                    f"[{self.name}] expand_b23: 展开短链失败 {current}: {e}"
+                )
                 return url
-        return url
+        return current
 
     def extract_p(self, url: str) -> int:
         """提取分P序号
@@ -1099,7 +1168,7 @@ class BilibiliParser(BaseVideoParser):
 
         display_url = (
             original_url
-            if B23_HOST in urlparse(original_url).netloc.lower()
+            if self._is_short_link_host(urlparse(original_url).netloc)
             else url
         )
         referer = url
@@ -2125,7 +2194,7 @@ class BilibiliParser(BaseVideoParser):
         """
         original_url = url
 
-        if B23_HOST in urlparse(url).netloc.lower():
+        if self._is_short_link_host(urlparse(url).netloc):
             expanded_url = await self.expand_b23(url, session)
 
             if '/opus/' not in expanded_url.lower() and 't.bilibili.com' not in expanded_url.lower():
@@ -2341,7 +2410,7 @@ class BilibiliParser(BaseVideoParser):
                 else:
                     final_timestamp = timestamp
 
-                dynamic_url = original_url if B23_HOST in urlparse(original_url).netloc.lower() else url
+                dynamic_url = original_url if self._is_short_link_host(urlparse(original_url).netloc) else url
                 if dynamic_url and origin_url and dynamic_url != origin_url:
                     final_url = f"{dynamic_url} ({origin_url})"
                 else:
@@ -2404,7 +2473,7 @@ class BilibiliParser(BaseVideoParser):
                     cookie_header=cookie_header
                 )
                 result = {
-                    "url": original_url if B23_HOST in urlparse(original_url).netloc.lower() else url,
+                    "url": original_url if self._is_short_link_host(urlparse(original_url).netloc) else url,
                     "title": final_title,
                     "author": author,
                     "desc": final_desc,
@@ -2445,7 +2514,7 @@ class BilibiliParser(BaseVideoParser):
                     elif isinstance(pic, str):
                         image_urls.append([pic])
 
-        display_url = original_url if B23_HOST in urlparse(original_url).netloc.lower() else url
+        display_url = original_url if self._is_short_link_host(urlparse(original_url).netloc) else url
 
         referer = url
         origin = "https://www.bilibili.com"
@@ -2556,6 +2625,16 @@ class BilibiliParser(BaseVideoParser):
             cookie_header = cookie_header_override
         else:
             cookie_header = await self._resolve_cookie_header(session)
+        # 兜底：外部传入的 Cookie 也可能缺 buvid3，缺了会撞上 412 风控
+        if cookie_header and not self._buvid_provider.has_buvid(cookie_header):
+            try:
+                cookie_header = await self._buvid_provider.ensure_buvid(
+                    session, cookie_header
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[{self.name}] 补充buvid失败: {e}")
 
         if is_live_url(page_url) or is_live_url(original_url):
             logger.debug(f"[{self.name}] parse_bilibili_minimal: 检测到直播域名链接，跳过解析 {original_url} -> {page_url}")
@@ -2725,7 +2804,7 @@ class BilibiliParser(BaseVideoParser):
                 cookie_header=cookie_header
             )
             result = {
-                "url": original_url if urlparse(original_url).netloc.lower() == B23_HOST else page_url,
+                "url": original_url if self._is_short_link_host(urlparse(original_url).netloc) else page_url,
                 "title": info.get("title", ""),
                 "author": info.get("author", ""),
                 "desc": info.get("desc", ""),
@@ -2748,7 +2827,7 @@ class BilibiliParser(BaseVideoParser):
                     )
                 return result
             raise RuntimeError(f"无法获取视频直链: {url}")
-        is_b23_short = urlparse(original_url).netloc.lower() == B23_HOST
+        is_b23_short = self._is_short_link_host(urlparse(original_url).netloc)
         display_url = original_url if is_b23_short else page_url
         
         referer = page_url
