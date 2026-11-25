@@ -12,7 +12,7 @@ from html import unescape
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import AsyncIterator, Optional, Dict, Any, Tuple, List
-from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urljoin
 
 import aiohttp
 
@@ -28,7 +28,12 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-B23_HOST = "b23.tv"
+#: B 站短链域名（b23.tv 为主，bili2233.cn 为备用）
+SHORT_LINK_HOSTS = ("b23.tv", "bili2233.cn")
+#: 短链最多跟随的重定向跳数
+SHORT_LINK_MAX_HOPS = 3
+#: 视为重定向的 HTTP 状态码
+REDIRECT_STATUS_CODES = (301, 302, 303, 307, 308)
 T_BILIBILI_HOST = "t.bilibili.com"
 BV_RE = re.compile(r"[Bb][Vv][0-9A-Za-z]{10,}")
 AV_RE = re.compile(r"[Aa][Vv](\d+)")
@@ -133,9 +138,13 @@ def _is_trusted_bilibili_host(hostname: str) -> bool:
 
 def _is_b23_url(url: str) -> bool:
     try:
-        return (urlparse(url).hostname or "").lower().rstrip(".") == B23_HOST
+        hostname = (urlparse(url).hostname or "").lower().rstrip(".")
     except (AttributeError, TypeError, ValueError):
         return False
+    return any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in SHORT_LINK_HOSTS
+    )
 
 
 def _is_t_bilibili_url(url: str) -> bool:
@@ -813,7 +822,10 @@ class BilibiliParser(BaseVideoParser):
             return False
         if parsed.scheme.lower() not in {"http", "https"}:
             return False
-        if hostname == B23_HOST:
+        if any(
+            hostname == domain or hostname.endswith(f".{domain}")
+            for domain in SHORT_LINK_HOSTS
+        ):
             logger.debug(f"[{self.name}] can_parse: 匹配b23短链 {url}")
             return True
         if not _is_trusted_bilibili_host(hostname):
@@ -875,7 +887,9 @@ class BilibiliParser(BaseVideoParser):
             for match in re.finditer(r'https?://[^\s<>"\'()\[\]，。！？；：）】》」]+', text, re.IGNORECASE)
         ]
 
-        b23_pattern = r'https?://[Bb]23\.tv/[^\s<>"\'()\[\]]+'
+        b23_pattern = (
+            r'https?://(?:[Bb]23\.tv|bili2233\.cn)/[^\s<>"\'()\[\]]+'
+        )
         b23_links = re.finditer(b23_pattern, text, re.IGNORECASE)
         b23_by_key = {}
         for match in b23_links:
@@ -1005,24 +1019,53 @@ class BilibiliParser(BaseVideoParser):
         return result
 
     async def expand_b23(self, url: str, session: aiohttp.ClientSession) -> str:
-        """展开b23短链"""
-        if urlparse(url).netloc.lower() == B23_HOST:
-            headers = {
-                "User-Agent": UA,
-                "Referer": "https://www.bilibili.com",
-                "Accept-Encoding": "gzip, deflate",
-            }
+        """展开 B 站短链（b23.tv / bili2233.cn）。
+
+        **不跟随重定向**，只读 302 的 ``Location`` 头。
+
+        为什么不能沿用 ``allow_redirects=True``：短链跳到的
+        ``www.bilibili.com/video/...`` 是个 **HTML 页面**，B 站的 web 风控
+        对它会返回 **412**。跟着跳就会额外拉一个必然失败的页面 —— 我们要的
+        只是 Location 里那个 BV 号。
+
+        参考实现：https://github.com/xiaoxi2760/astrbot_plugin_denia_share
+        （其 ``get_redirect_url`` 同样是 ``follow_redirects=False`` + 读 Location）
+        """
+        if not _is_b23_url(url):
+            return url
+
+        headers = {
+            "User-Agent": UA,
+            "Referer": "https://www.bilibili.com",
+            "Accept-Encoding": "gzip, deflate",
+        }
+
+        current = url
+        for _ in range(SHORT_LINK_MAX_HOPS):
             try:
                 async with session.get(
-                    url,
+                    current,
                     headers=headers,
-                    allow_redirects=True,
+                    allow_redirects=False,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as response:
-                    return str(response.url)
-            except Exception:
+                    if response.status in REDIRECT_STATUS_CODES:
+                        location = response.headers.get("Location") or ""
+                        if not location:
+                            return current
+                        current = urljoin(current, location)
+                        # 落点已经不是短链域名，说明展开完成
+                        if not _is_b23_url(current):
+                            return current
+                        continue
+                    # 没有重定向：短链直接返回内容，取当前地址即可
+                    return current
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(f"[{self.name}] expand_b23: 展开短链失败 {current}: {exc}")
                 return url
-        return url
+        return current
 
     def extract_p(self, url: str) -> int:
         """提取分P序号
@@ -1599,6 +1642,17 @@ class BilibiliParser(BaseVideoParser):
                 if resp.status != 200 or resp.content_type != "text/html":
                     return {}
                 state = self._extract_initial_state_from_html(await resp.text())
+        except _BilibiliRequestLimited:
+            # 视频页被 B 站 web 风控拦下（HTTP 412/429）。这不是致命错误：
+            # 公开视频页只是匿名解析的**首选**取数途径，详情接口才是兜底。
+            # 这里吞掉限制信号并返回空字典，让调用方回退到详情接口
+            # （访客 Cookie 已带 buvid，实测可用），而不是让整条解析挂掉。
+            logger.debug("B站视频页被风控限制，回退到详情接口")
+            return {}
+        except RuntimeError:
+            # 视频页不可访问（4xx）：同样不是致命错误，交由详情接口给出最终结论
+            logger.debug("B站视频页不可访问，回退到详情接口")
+            return {}
         except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError) as exc:
             logger.debug(f"B站视频页读取失败：{type(exc).__name__}")
             return {}
