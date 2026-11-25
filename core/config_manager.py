@@ -294,11 +294,15 @@ class ReactionMessageConfig:
         enabled: 是否启用表情回应。
         emoji_ids: 可使用的表情 ID 列表。
         strategy: 随机一个或按列表依次回应。
+        interval: 依次回应时每个表情之间的间隔（秒）。
+        skip_admin_command: 显式管理命令触发解析时是否跳过表情回应。
     """
 
     enabled: bool = False
     emoji_ids: List[int] = field(default_factory=lambda: [127827])
     strategy: str = "随机"
+    interval: float = 0.5
+    skip_admin_command: bool = True
 
 
 @dataclass
@@ -755,6 +759,14 @@ class ConfigManager:
                     "依次回应"
                     if str(reaction.get("strategy", "随机")).strip() == "依次回应"
                     else "随机"
+                ),
+                interval=self._parse_non_negative_float(
+                    reaction.get("interval", 0.5), 0.5
+                ),
+                skip_admin_command=self._parse_bool(
+                    reaction.get("skip_admin_command", True),
+                    True,
+                    "message.reaction.skip_admin_command",
                 ),
             ),
             opening=OpeningMessageConfig(
