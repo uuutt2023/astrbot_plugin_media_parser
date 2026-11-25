@@ -713,12 +713,30 @@
                     "strategy": {
                         "description": "回应策略",
                         "type": "string",
-                        "hint": "随机：每条消息抽一个；依次回应：对同一消息按列表依次回应，间隔 0.5 秒。",
+                        "hint": "随机：每条消息抽一个；依次回应：对同一消息按列表依次回应，间隔由下方「依次回应的间隔」决定。",
                         "options": [
                             "随机",
                             "依次回应"
                         ],
                         "default": "随机",
+                        "condition": {
+                            "enable": true
+                        }
+                    },
+                    "interval": {
+                        "description": "依次回应的间隔（秒）",
+                        "type": "float",
+                        "hint": "按列表依次回应时，每个表情之间的间隔。适当间隔比较自然，符合真人感，也避免触发协议端风控。",
+                        "default": 0.5,
+                        "condition": {
+                            "enable": true
+                        }
+                    },
+                    "skip_admin_command": {
+                        "description": "跳过显式管理命令",
+                        "type": "bool",
+                        "hint": "开启后，使用打包等显式命令触发解析时不给原消息贴表情；仅对用户分享链接被自动解析的情况回应。",
+                        "default": true,
                         "condition": {
                             "enable": true
                         }

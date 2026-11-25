@@ -71,7 +71,7 @@ if _plugin_directory.parent.name in {"plugins", "reserved_plugins"}:
     "astrbot_plugin_media_parser",
     "drdon1234",
     "聚合解析平台分享内容，发送视频、音频、图片与文本",
-    "1.17.3",
+    "1.17.4",
 )
 class VideoParserPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -898,8 +898,8 @@ class VideoParserPlugin(Star):
             else [choice(reaction.emoji_ids)]
         )
         for index, emoji_id in enumerate(emoji_ids):
-            if index:
-                await asyncio.sleep(0.5)
+            if index and reaction.interval > 0:
+                await asyncio.sleep(reaction.interval)
             try:
                 await asyncio.wait_for(
                     bot.call_action(
@@ -1519,9 +1519,15 @@ class VideoParserPlugin(Star):
 
         reaction_task = None
         if cfg.message.reaction.enabled and cfg.message.reaction.emoji_ids:
-            reaction_task = asyncio.create_task(self._send_reaction_emoji(event))
-            self._reaction_tasks.add(reaction_task)
-            reaction_task.add_done_callback(self._reaction_tasks.discard)
+            # 显式管理命令（如打包）不是「分享内容被自动解析」，默认不贴表情，
+            # 避免对指令消息刷表情。可通过配置关闭这一跳过行为。
+            skip_reaction = (
+                cfg.message.reaction.skip_admin_command and zip_requested
+            )
+            if not skip_reaction:
+                reaction_task = asyncio.create_task(self._send_reaction_emoji(event))
+                self._reaction_tasks.add(reaction_task)
+                reaction_task.add_done_callback(self._reaction_tasks.discard)
         try:
             if not zip_requested:
                 for link, _parser in links_with_parser:
